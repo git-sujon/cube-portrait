@@ -12,7 +12,7 @@
  *   energy arcs            short red lightning segments, rebuilt ~16 times a second
  *   portrait source        sample face + loading the user's photo
  *   build cubes            photo (+ optional depth map) -> which cubes join the figure, their colour,
- *                          height, start and target positions
+ *                          height, surface slopes, start and target positions
  *   CPU mirror             the same flight path in JS, used only to place arcs
  *   sizing / controls      resize, buttons, sliders, drag and drop
  *   frame loop             advances the timeline and renders
@@ -37,7 +37,7 @@
   var FACE_H = 10;            // portrait height in world units
   var ASPECT = 1.25;          // rows / cols  (4:5 portrait)
   var BASE_DURATION = 8;      // seconds for a full assembly at speed 1
-  var PILE_R = 13;             // radius of the heap of cubes on the floor
+  var PILE_R = 13;            // radius of the heap of cubes on the floor
   var STAGGER = 1.6;          // how spread out individual cube launches are
   var isSmall = Math.min(window.innerWidth, window.innerHeight) < 620;
   var reduceMotion = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
@@ -81,6 +81,7 @@
     controls.target.set(0, -0.4, 0);
     controls.addEventListener('start', function () { userCam = true; });
   }
+  canvas.addEventListener('dblclick', function () { userCam = false; });
 
   var composer = null, bloom = null, fxaa = null;
   if (THREE.EffectComposer && THREE.RenderPass && THREE.UnrealBloomPass) {
@@ -103,11 +104,12 @@
     extensions: { derivatives: true },
     vertexShader: [
       'attribute vec3 aStart;',      // resting place on the floor
-      'attribute vec3 aTarget;',     // xy = grid position, z = brightness - 0.5
+      'attribute vec3 aTarget;',     // xy = grid position, z = height - 0.5
       'attribute vec4 aColor;',      // rgb = photo colour, a = how deep in the pile
       'attribute vec4 aSeed;',       // x = launch delay, yzw = random
+      'attribute vec3 aRelief;',     // xy = heightfield slope (dh/dx, dh/dy), z = local cavity AO
       'uniform float uProgress, uTime, uCube, uDepth, uStagger;',
-      'varying vec3 vColor, vLocal, vViewW;',
+      'varying vec3 vColor, vLocal, vViewW, vRelief;',
       'varying mat3 vRot;',
       'varying float vT, vSeed, vTint, vWy, vDeep;',
       'float ease(float t){ return t*t*t*(t*(6.0*t-15.0)+10.0); }',
@@ -145,14 +147,15 @@
       '  vec4 wp = modelMatrix * vec4(c + p, 1.0);',
       '  gl_Position = projectionMatrix * viewMatrix * wp;',
       '  vColor = aColor.rgb; vLocal = position; vT = t; vSeed = aSeed.w; vTint = aSeed.z;',
+      '  vRelief = aRelief;',
       '  vRot = mat3(modelMatrix) * R;',
       '  vViewW = cameraPosition - wp.xyz;',
       '  vWy = wp.y;',
       '}'
     ].join('\n'),
     fragmentShader: [
-      'uniform float uTime, uGlow, uSettle;',
-      'varying vec3 vColor, vLocal, vViewW;',
+      'uniform float uTime, uGlow, uSettle, uDepth;',
+      'varying vec3 vColor, vLocal, vViewW, vRelief;',
       'varying mat3 vRot;',
       'varying float vT, vSeed, vTint, vWy, vDeep;',
       'float hash(vec2 p){ return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }',
@@ -207,13 +210,15 @@
       '  vec3 hot = vec3(1.0, 0.72, 0.55);',
       '  vec3 emis = mix(red, hot, tr*0.6) * tr * flow * charge * uGlow * 1.1;',
       '  vec3 energized = glass + emis + red * edge * 0.25 * uGlow * charge + refl * (F + 0.05);',
-      // the portrait: true photo colour with only a trace of gloss
+      // the portrait: blend cube bevel normal with macro 3D relief normal so head turns catch real light
+      '  float front = step(5.5, fid);',
+      '  vec3 macroN = normalize(vRot * normalize(nl + vec3(vRelief.xy * uDepth * 0.22 * front, 0.0)));',
       '  float amb = mix(0.55, 0.85, far);',
-      '  float shade = amb + (1.0 - amb) * max(dot(n, normalize(vec3(0.12, 0.2, 1.0))), 0.0);',
+      '  float shade = amb + (1.0 - amb) * max(dot(macroN, normalize(vec3(0.18, 0.24, 1.0))), 0.0);',
+      '  shade *= vRelief.z;',   // subtle cavity occlusion between recessed neighbour cubes
       '  vec3 photo = vColor * shade + refl * F * 0.10;',
       // the photo wraps a little way down each column so the face survives a turn of the head;
       // deeper down (the outline of the figure) the columns are dark glass with a few live traces
-      '  float front = step(5.5, fid);',
       '  float deep = smoothstep(1.2, 3.5, vDeep) * (1.0 - front);',
       '  vec3 sideCol = vColor * 0.16 + glass * 0.45 + red * tr * 0.22 * uGlow + refl * F * 0.35;',
       '  photo = mix(photo * mix(0.82, 1.0, front), sideCol, deep);',
@@ -413,6 +418,14 @@
     }
     if (filled < n * 0.06 || filled > n * 0.9) return false;   // no plain backdrop found
     for (i = 0; i < n; i++) mask[i] = seen[i] ? 0 : 1;
+    // clean single-pixel pinholes inside the silhouette and stray specks outside
+    var copy = new Uint8Array(mask);
+    for (y = 1; y < rows - 1; y++) for (x = 1; x < cols - 1; x++) {
+      i = y * cols + x;
+      var nb = copy[i - 1] + copy[i + 1] + copy[i - cols] + copy[i + cols];
+      if (!copy[i] && nb >= 3) mask[i] = 1;
+      else if (copy[i] && nb === 0) mask[i] = 0;
+    }
     return true;
   }
 
@@ -478,18 +491,31 @@
 
     var px = coverCrop(sampler, sctx, source, cols, rows);
     var shape = analyse(px, cols, rows), height = shape.height, mask = shape.mask;
+    var smoothH = blur3(height, cols, rows);
 
     starts = new Float32Array(count * 3);
     targets = new Float32Array(count * 3);
     seeds = new Float32Array(count * 4);
     var colors = new Float32Array(count * 4);
-    var halfW = (cols - 1) / 2, halfH = (rows - 1) / 2, i, x, y, inFigure = 0;
+    var relief = new Float32Array(count * 3);
+    var halfW = (cols - 1) / 2, halfH = (rows - 1) / 2, i, x, y;
 
     for (y = 0; y < rows; y++) {
       for (x = 0; x < cols; x++) {
         i = y * cols + x;
         var tx = (x - halfW) * cubeSize, ty = (halfH - y) * cubeSize;
         targets[i * 3] = tx; targets[i * 3 + 1] = ty; targets[i * 3 + 2] = height[i] - 0.5;
+
+        // macro surface slope and local cavity occlusion from neighbour heights
+        var xL = x > 0 ? x - 1 : x, xR = x < cols - 1 ? x + 1 : x;
+        var yU = y > 0 ? y - 1 : y, yD = y < rows - 1 ? y + 1 : y;
+        var hL = smoothH[y * cols + xL], hR = smoothH[y * cols + xR];
+        var hU = smoothH[yU * cols + x], hD = smoothH[yD * cols + x];
+        relief[i * 3]     = (hL - hR) * 0.5 / cubeSize;
+        relief[i * 3 + 1] = (hD - hU) * 0.5 / cubeSize;
+        var avgNb = 0.25 * (hL + hR + hU + hD);
+        var cav = Math.max(0, avgNb - height[i]);
+        relief[i * 3 + 2] = 1 - Math.min(0.28, cav * 2.2);
 
         seeds[i * 4 + 1] = Math.random(); seeds[i * 4 + 2] = Math.random(); seeds[i * 4 + 3] = Math.random();
 
@@ -510,7 +536,6 @@
           // launch order: centre of the figure first, edges last, with some randomness
           var d = Math.min(1, Math.sqrt(tx * tx + ty * ty) / (FACE_H * 0.64));
           seeds[i * 4] = Math.min(1, 0.6 * d + 0.4 * Math.random());
-          inFigure++;
         } else {
           seeds[i * 4] = 2;      // background cube: a delay it can never reach, so it stays on the floor
         }
@@ -523,6 +548,7 @@
     geo.setAttribute('aTarget', new THREE.InstancedBufferAttribute(targets, 3));
     geo.setAttribute('aColor', new THREE.InstancedBufferAttribute(colors, 4));
     geo.setAttribute('aSeed', new THREE.InstancedBufferAttribute(seeds, 4));
+    geo.setAttribute('aRelief', new THREE.InstancedBufferAttribute(relief, 3));
     mesh = new THREE.InstancedMesh(geo, material, count);
     mesh.frustumCulled = false;
     group.add(mesh);
@@ -591,9 +617,7 @@
     camera.updateProjectionMatrix();
     var tanH = Math.tan(camera.fov * Math.PI / 360);
     var faceW = FACE_H / ASPECT;
-    var dist = Math.max(FACE_H * 0.66 / tanH, faceW * 0.6 / (tanH * camera.aspect));
-    fitDist = dist;
-    if (userCam) camera.position.setLength(dist);
+    fitDist = Math.max(FACE_H * 0.66 / tanH, faceW * 0.6 / (tanH * camera.aspect));
   }
   window.addEventListener('resize', resize);
 
@@ -731,8 +755,25 @@
     // until you take the camera, it starts low beside the heap and pulls back to frame the face
     if (!userCam) {
       var k = smooth(0.04, 0.72, p);
-      camera.position.set(lerp(3.4, 0, k), lerp(FLOOR_Y + 1.5, 0.2 + fitDist * 0.053, k), lerp(10.5, fitDist * 0.9986, k));
-      if (controls) controls.target.set(0, lerp(FLOOR_Y + 1.3, 0.2, k), 0); else camera.lookAt(0, lerp(FLOOR_Y + 1.3, 0.2, k), 0);
+      var goalX = lerp(3.4, 0, k);
+      var goalY = lerp(FLOOR_Y + 1.5, 0.2 + fitDist * 0.053, k);
+      var goalZ = lerp(10.5, fitDist * 0.9986, k);
+      var goalTY = lerp(FLOOR_Y + 1.3, 0.2, k);
+      var camEase = Math.min(1, dt * 6);
+      camera.position.set(
+        lerp(camera.position.x, goalX, camEase),
+        lerp(camera.position.y, goalY, camEase),
+        lerp(camera.position.z, goalZ, camEase)
+      );
+      if (controls) {
+        controls.target.set(
+          lerp(controls.target.x, 0, camEase),
+          lerp(controls.target.y, goalTY, camEase),
+          lerp(controls.target.z, 0, camEase)
+        );
+      } else {
+        camera.lookAt(0, goalTY, 0);
+      }
     }
     if (controls) controls.update();
 
