@@ -10,6 +10,7 @@
  *   cube material          the vertex shader moves every cube; the fragment shader paints it
  *   floor and backdrop     wet floor with red spill, hazy sky sphere
  *   energy arcs            short red lightning segments, rebuilt ~16 times a second
+ *   sound engine           layered block contacts, timed to representative cubes
  *   portrait source        sample face + loading the user's photo
  *   build cubes            photo (+ optional depth map) -> which cubes join the figure, their colour,
  *                          height, surface slopes, start and target positions
@@ -47,7 +48,7 @@
     progress: reduceMotion ? 1 : 0,
     dir: 0,                   // 1 assembling, -1 scattering, 0 paused
     holdUntil: reduceMotion ? Infinity : 1.2,   // auto-start after this many seconds
-    speed: 1, glow: 1, depth: 2.2, cutout: true
+    speed: 1, glow: 1, depth: 2.2, cutout: true, sound: true
   };
 
   /* ---------- renderer / scene ---------- */
@@ -301,6 +302,208 @@
   var sampler = document.createElement('canvas');  // downsampled to the cube grid
   var sctx = sampler.getContext('2d', { willReadFrequently: true });
 
+  var mesh = null, starts, targets, seeds, count = 0, cubeSize = 0.1;
+
+  /* ---------- physical block sounds: short contacts, no continuous noise/hum ---------- */
+  var sfx = (function () {
+    var ctx = null, master = null, bus = null;
+    var banks = { lock: [], floor: [], arc: [] }, voices = [], cues = [];
+    var prevP = state.progress, scheduledP = prevP, direction = 0, lastArc = -Infinity;
+    var MAX_CUBES = 180, MAX_VOICES = 40, LOOK_AHEAD = 0.025;
+
+    // Bake small variations once. Inharmonic resonances give contacts a solid
+    // body; soft attacks and tapered tails avoid digital clicks and pitch chirps.
+    function makeContact(kind) {
+      var floor = kind === 'floor', arc = kind === 'arc';
+      var duration = arc ? 0.024 : (floor ? 0.14 : 0.10);
+      var buffer = ctx.createBuffer(1, Math.ceil(ctx.sampleRate * duration), ctx.sampleRate);
+      var data = buffer.getChannelData(0), low = 0, peak = 0;
+      var fundamental = floor ? 210 + Math.random() * 100 : 420 + Math.random() * 190;
+      var ratios = [1, 1.47 + Math.random() * 0.12, 2.31, 3.79];
+      var weights = [0.56, 0.25, 0.13, 0.06];
+      var hits = floor ? [0, 0.019 + Math.random() * 0.012, 0.047 + Math.random() * 0.012]
+        : [0, 0.008 + Math.random() * 0.004];
+      for (var i = 0; i < data.length; i++) {
+        var t = i / ctx.sampleRate, noise = Math.random() * 2 - 1, sample = 0;
+        low += 0.38 * (noise - low);
+        if (arc) {
+          // A short electrical crack, tucked behind the physical contacts.
+          sample = (noise - low) * Math.exp(-t / 0.0035) * (1 - Math.exp(-t / 0.0004));
+        } else {
+          for (var h = 0; h < hits.length; h++) {
+            var age = t - hits[h];
+            if (age < 0) continue;
+            var body = 0, decay = floor ? 0.023 : 0.017;
+            for (var m = 0; m < ratios.length; m++) {
+              body += weights[m] * Math.sin(2 * Math.PI * fundamental * ratios[m] * age)
+                * Math.exp(-age / (decay / (1 + m * 0.65)));
+            }
+            var contact = low * 0.45 * Math.exp(-age / (floor ? 0.0038 : 0.002));
+            sample += (body + contact) * (1 - Math.exp(-age / 0.0006)) * Math.pow(0.3, h);
+          }
+        }
+        sample *= Math.min(1, (duration - t) / 0.008);
+        data[i] = sample;
+        peak = Math.max(peak, Math.abs(sample));
+      }
+      for (var j = 0; j < data.length; j++) data[j] *= 0.85 / Math.max(peak, 0.001);
+      return buffer;
+    }
+
+    function ready() {
+      return ctx && ctx.state === 'running' && state.sound && !document.hidden;
+    }
+
+    function reset(p) {
+      prevP = scheduledP = p;
+      direction = 0;
+      lastArc = -Infinity;
+      if (!ctx) return;
+      // Cancel queued contacts too, so pausing/seeking never leaves a burst behind.
+      var now = ctx.currentTime;
+      voices.splice(0).forEach(function (v) {
+        v.gain.gain.cancelScheduledValues(now);
+        v.gain.gain.setTargetAtTime(0, now, 0.005);
+        v.source.stop(now + 0.025);
+      });
+    }
+
+    function init() {
+      if (!state.sound) return;
+      if (!ctx) {
+        var AC = window.AudioContext || window.webkitAudioContext;
+        if (!AC) return;
+        try { ctx = new AC(); } catch (e) { return; }
+        bus = ctx.createBiquadFilter();
+        bus.type = 'highpass'; bus.frequency.value = 90; bus.Q.value = 0.7;
+        var tone = ctx.createBiquadFilter();
+        tone.type = 'lowpass'; tone.frequency.value = 6800; tone.Q.value = 0.7;
+        var compressor = ctx.createDynamicsCompressor();
+        compressor.threshold.value = -16; compressor.knee.value = 12;
+        compressor.ratio.value = 4; compressor.attack.value = 0.003; compressor.release.value = 0.09;
+        master = ctx.createGain();
+        master.gain.value = 0.7;
+        bus.connect(tone); tone.connect(compressor); compressor.connect(master); master.connect(ctx.destination);
+        Object.keys(banks).forEach(function (kind) {
+          for (var i = 0; i < (kind === 'arc' ? 4 : 8); i++) banks[kind].push(makeContact(kind));
+        });
+        reset(state.progress);
+      }
+      if (ctx.state === 'suspended' || ctx.state === 'interrupted') {
+        // A blocked/interrupted context can retry on the next gesture.
+        ctx.resume().catch(function () {});
+      }
+    }
+
+    ['pointerdown', 'keydown', 'touchstart'].forEach(function (ev) {
+      window.addEventListener(ev, init, { passive: true });
+    });
+    document.addEventListener('visibilitychange', function () { reset(state.progress); });
+
+    function play(kind, when, pitch, pan, level, variant) {
+      if (!ready() || voices.length >= MAX_VOICES) return;
+      var sourceNode = ctx.createBufferSource(), gain = ctx.createGain(), panner = null;
+      sourceNode.buffer = banks[kind][variant % banks[kind].length];
+      sourceNode.playbackRate.value = pitch;
+      gain.gain.value = level;
+      sourceNode.connect(gain);
+      if (ctx.createStereoPanner) {
+        panner = ctx.createStereoPanner();
+        panner.pan.value = Math.max(-0.8, Math.min(0.8, pan));
+        gain.connect(panner); panner.connect(bus);
+      } else {
+        gain.connect(bus);
+      }
+      var voice = { source: sourceNode, gain: gain };
+      voices.push(voice);
+      sourceNode.onended = function () {
+        sourceNode.disconnect(); gain.disconnect();
+        if (panner) panner.disconnect();
+        var index = voices.indexOf(voice);
+        if (index !== -1) voices.splice(index, 1);
+      };
+      sourceNode.start(when);
+    }
+
+    // Follow real launch times/positions without giving thousands of cubes a voice.
+    // Reservoir sampling keeps a similar mix when the cube density changes.
+    function rebuild() {
+      reset(state.progress);
+      cues = [];
+      var selected = [], seen = 0;
+      for (var i = 0; i < count; i++) {
+        if (seeds[i * 4] > 1) continue;
+        seen++;
+        if (selected.length < MAX_CUBES) selected.push(i);
+        else {
+          var slot = Math.floor(Math.random() * seen);
+          if (slot < MAX_CUBES) selected[slot] = i;
+        }
+      }
+      selected.forEach(function (cube, n) {
+        var delay = seeds[cube * 4] * STAGGER;
+        var variation = seeds[cube * 4 + 1], weight = seeds[cube * 4 + 2];
+        cues.push({ at: (0.96 + delay) / (1 + STAGGER), kind: 'lock',
+          pan: targets[cube * 3] / (FACE_H / ASPECT * 0.5) * 0.7,
+          pitch: 0.88 + variation * 0.28, level: 0.10 + weight * 0.09, variant: n % 8 });
+        if (n % 3 !== 0) cues.push({ at: (0.06 + delay) / (1 + STAGGER), kind: 'floor',
+          pan: starts[cube * 3] / PILE_R * 0.75,
+          pitch: 0.85 + variation * 0.30, level: 0.055 + weight * 0.055, variant: n % 8 });
+      });
+      cues.sort(function (a, b) { return a.at - b.at; });
+    }
+
+    function fireArcSnap(strength) {
+      if (!ready() || state.dir === 0 || state.glow <= 0.05 || ctx.currentTime - lastArc < 0.14) return;
+      lastArc = ctx.currentTime;
+      play('arc', lastArc + 0.005, 0.85 + Math.random() * 0.3, (Math.random() - 0.5) * 1.2,
+        Math.min(0.028, 0.018 * strength * state.glow), Math.floor(Math.random() * 4));
+    }
+
+    function update(dt, p) {
+      var dp = p - prevP;
+      if (!ready()) {
+        prevP = scheduledP = p; direction = 0;
+        return;
+      }
+      if (Math.abs(dp) < 0.000001) return;
+      // Large jumps are seeks/restarts, never hundreds of contacts at once.
+      if (Math.abs(dp) > 0.08) { reset(p); return; }
+      var dir = dp > 0 ? 1 : -1;
+      if (dir !== direction) { scheduledP = prevP; direction = dir; }
+      var rate = dp / Math.max(dt, 0.001);
+      var end = Math.max(0, Math.min(1, p + rate * LOOK_AHEAD));
+      var speedGain = Math.min(1.15, Math.max(0.75, Math.sqrt(Math.abs(rate) * BASE_DURATION)));
+      var now = ctx.currentTime;
+      for (var i = 0; i < cues.length; i++) {
+        var cue = cues[i];
+        var crossed = dir > 0 ? cue.at > scheduledP && cue.at <= end : cue.at < scheduledP && cue.at >= end;
+        if (!crossed) continue;
+        var when = now + 0.005 + Math.max(0, (cue.at - p) / rate);
+        // Crisp seating on assembly; soft releases and weightier floor tumbles on scatter.
+        var pitch = cue.pitch * (dir < 0 ? (cue.kind === 'lock' ? 0.85 : 0.78) : 1);
+        var level = cue.level * speedGain * (dir < 0 ? (cue.kind === 'floor' ? 1.5 : 0.7) : 1);
+        play(cue.kind, when, pitch, cue.pan, level, cue.variant);
+      }
+      scheduledP = dir > 0 ? Math.max(scheduledP, end) : Math.min(scheduledP, end);
+      if (p === 1 && prevP < 1 && cues.length) play('lock', now + 0.01, 0.72, 0, 0.16, 0);
+      prevP = p;
+    }
+
+    function setEnabled(on) {
+      state.sound = on;
+      reset(state.progress);
+      if (on) init();
+      if (master) {
+        master.gain.cancelScheduledValues(ctx.currentTime);
+        master.gain.setTargetAtTime(on ? 0.7 : 0, ctx.currentTime, 0.015);
+      }
+    }
+
+    return { init: init, update: update, rebuild: rebuild, reset: reset,
+      fireArcSnap: fireArcSnap, setEnabled: setEnabled };
+  })();
+
   function drawSampleFace() {
     source.width = 480; source.height = 600;
     var g = source.getContext('2d');
@@ -365,8 +568,6 @@
   }
 
   /* ---------- build cubes from the photo ---------- */
-  var mesh = null, starts, targets, seeds, count = 0, cubeSize = 0.1;
-
   var depthSrc = null;                                  // optional depth map (white = near, alpha = person)
   var sampler2 = document.createElement('canvas');
   var sctx2 = sampler2.getContext('2d', { willReadFrequently: true });
@@ -535,12 +736,14 @@
         if (mask[i]) {
           // launch order: centre of the figure first, edges last, with some randomness
           var d = Math.min(1, Math.sqrt(tx * tx + ty * ty) / (FACE_H * 0.64));
-          seeds[i * 4] = Math.min(1, 0.6 * d + 0.4 * Math.random());
+          var delay = Math.min(1, 0.6 * d + 0.4 * Math.random());
+          seeds[i * 4] = delay;
         } else {
           seeds[i * 4] = 2;      // background cube: a delay it can never reach, so it stays on the floor
         }
       }
     }
+    sfx.rebuild();
 
     if (mesh) { group.remove(mesh); mesh.geometry.dispose(); }
     var geo = new THREE.BoxGeometry(1, 1, 1);
@@ -575,7 +778,7 @@
   }
 
   function updateArcs(active) {
-    var o = 0, k, s;
+    var o = 0, k, s, drawn = 0;
     for (k = 0; k < ARCS; k++) {
       var ok = false;
       if (k < active && count) {
@@ -591,6 +794,7 @@
         for (s = 0; s < ARC_SEG * 6; s++) arcPos[o++] = 0;
         continue;
       }
+      drawn++;
       var len = Math.min(dist, 0.5 + Math.random() * 2.2), f = len / dist;
       var bx = ax + dx * f, by = ay + dy * f, bz = az + dz * f;
       var px = ax, py = ay, pz = az, jit = len * 0.14;
@@ -605,6 +809,9 @@
       }
     }
     arcGeo.attributes.position.needsUpdate = true;
+    if (drawn > 0 && state.dir !== 0 && Math.random() < 0.35) {
+      sfx.fireArcSnap(drawn / ARCS);
+    }
   }
 
   /* ---------- sizing ---------- */
@@ -622,19 +829,28 @@
   window.addEventListener('resize', resize);
 
   /* ---------- controls ---------- */
-  var playBtn = $('play'), scrub = $('scrub'), pct = $('pct');
+  var playBtn = $('play'), scrub = $('scrub'), pct = $('pct'), soundChk = $('sound');
 
   function toggle() {
+    sfx.init();
     state.holdUntil = Infinity;
     if (state.dir !== 0) state.dir = 0;
     else state.dir = state.progress >= 0.999 ? -1 : 1;
+    sfx.reset(state.progress);
   }
   playBtn.addEventListener('click', toggle);
   window.addEventListener('keydown', function (e) {
-    if (e.code === 'Space' && !/^(INPUT|BUTTON)$/.test(e.target.tagName)) { e.preventDefault(); toggle(); }
+    if (e.repeat || e.ctrlKey || e.metaKey || e.altKey || e.target.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(e.target.tagName)) return;
+    if (e.code === 'Space' && e.target.tagName !== 'BUTTON') { e.preventDefault(); toggle(); }
+    else if (e.code === 'KeyM') {
+      soundChk.checked = !soundChk.checked;
+      sfx.setEnabled(soundChk.checked);
+    }
   });
   scrub.addEventListener('input', function () {
+    sfx.init();
     state.holdUntil = Infinity; state.dir = 0; state.progress = scrub.value / 1000;
+    sfx.reset(state.progress);
   });
 
   var tune = $('tune'), tuneBtn = $('tuneBtn');
@@ -656,6 +872,7 @@
   bindSlider('depth', 'vDepth', function (v) { return v.toFixed(2); }, function (v) { state.depth = v; });
   function setDepth(v) { state.depth = v; $('depth').value = v; $('vDepth').textContent = v.toFixed(2); }
   $('cutout').addEventListener('change', function (e) { state.cutout = e.target.checked; build(); });
+  soundChk.addEventListener('change', function (e) { sfx.setEnabled(e.target.checked); });
   bindSlider('speed', 'vSpeed', function (v) { return v.toFixed(1) + '×'; }, function (v) { state.speed = v; });
   bindSlider('glow', 'vGlow', function (v) { return Math.round(v * 100) + '%'; }, function (v) { state.glow = v; });
 
@@ -666,6 +883,7 @@
     depthSrc = null; setDepth(2.2);
     build();
     state.progress = 0; state.dir = 0;
+    sfx.reset(state.progress);
     state.holdUntil = clock.elapsedTime + 0.9;
     userCam = false;
     $('hint').classList.add('gone');
@@ -732,6 +950,8 @@
     uniforms.uGlow.value = state.glow;
     uniforms.uSettle.value = settle;
     floorUniforms.uEnergy.value = state.glow * (1 - 0.85 * settle);
+
+    sfx.update(dt, p);
 
     // bloom is heavy and low-threshold for the red energy, then backs off for the photo
     if (bloom) {

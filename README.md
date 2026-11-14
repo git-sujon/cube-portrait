@@ -37,6 +37,7 @@ Your photo is read by the browser only. Nothing is uploaded.
 | Tune → Relief depth | How deep the figure is, front to back |
 | Tune → Speed | Playback rate |
 | Tune → Red energy | Strength of the glow, traces, arcs, bloom and the afterglow band |
+| Tune → Sound / M | Toggle the block sound effects. Click or press a key first to enable browser audio |
 | Tune → Remove background | Leaves backdrop cubes on the floor so only the person is built (used when no depth map supplies a cut-out) |
 | Tune → Add depth map | Loads a depth image for the current photo (see [Depth maps](#depth-maps)) |
 
@@ -111,6 +112,14 @@ For each cube:
 - **Bloom** is strong with a low threshold while cubes fly, then eases down with a high threshold as the portrait settles, so the photo is not washed out.
 - **FXAA** runs last to smooth edges.
 - **Camera** starts low beside the heap and pulls back to frame the figure, which then turns slowly from side to side. The first drag hands control to you and stops the turn; loading a new photo resets it. Orbit is limited to the front half because the figure has a flat back.
+
+### 6. Sound
+
+The Web Audio engine makes short block contacts locally; no audio files are downloaded. Each contact combines a low body, several irregular resonances and a brief surface tap. Assembly uses firmer seating clicks, while scatter uses softer releases and lower floor tumbles. Electrical accents sit quietly behind them.
+
+A sample of up to 180 actual cubes supplies the timing and left/right position, keeping the sound tied to the animation at every density and speed. Variations are generated once and reused, with a limit on simultaneous voices and compression for busy moments. Pausing, muting, scrubbing, rebuilding or hiding the page clears queued sounds. Scrubbing is silent; playback resumes from the selected point.
+
+Sound starts after the first click, tap or key press. Tune → Sound or **M** mutes it. There is no background loop, and the finished portrait is silent after the last contact fades.
 
 ## Depth maps
 
