@@ -7,15 +7,16 @@
  * File map (search for the banner comments):
  *   constants & state      tunable numbers and the playback state
  *   renderer / scene       WebGL renderer, camera, orbit controls, bloom + FXAA
- *   cube material          the vertex shader moves every cube; the fragment shader paints it
- *   floor and backdrop     wet floor with red spill, hazy sky sphere
+ *   cube material          vertex shader (flight, spring recoil, hover ripple) & fragment shader
+ *                          (bevels, non-stretched column traces, 3D relief normals, rim lighting)
+ *   floor and backdrop     wet floor with red spill & mirrored bust reflection, hazy sky sphere
  *   energy arcs            short red lightning segments, rebuilt ~16 times a second
  *   sound engine           layered block contacts, timed to representative cubes
  *   portrait source        sample face + loading the user's photo
  *   build cubes            photo (+ optional depth map) -> which cubes join the figure, their colour,
  *                          height, surface slopes, start and target positions
  *   CPU mirror             the same flight path in JS, used only to place arcs
- *   sizing / controls      resize, buttons, sliders, drag and drop
+ *   sizing / controls      resize, pointer hover raycast, buttons, sliders, drag and drop
  *   frame loop             advances the timeline and renders
  *
  * See README.md for the full walkthrough.
@@ -69,7 +70,7 @@
   var group = new THREE.Group();
   scene.add(group);
 
-  var controls = null, userCam = false, fitDist = 30;
+  var controls = null, userCam = false, orbiting = false, fitDist = 30;
   if (THREE.OrbitControls) {
     controls = new THREE.OrbitControls(camera, canvas);
     controls.enableDamping = true;
@@ -80,7 +81,8 @@
     controls.maxPolarAngle = Math.PI / 2 + 0.1;   // stay above the floor
     controls.minAzimuthAngle = -1.75; controls.maxAzimuthAngle = 1.75;   // the figure is a relief: keep off its flat back
     controls.target.set(0, -0.4, 0);
-    controls.addEventListener('start', function () { userCam = true; });
+    controls.addEventListener('start', function () { userCam = true; orbiting = true; });
+    controls.addEventListener('end', function () { orbiting = false; });
   }
   canvas.addEventListener('dblclick', function () { userCam = false; });
 
@@ -97,7 +99,8 @@
   var uniforms = {
     uProgress: { value: 0 }, uTime: { value: 0 }, uCube: { value: 0.1 },
     uDepth: { value: state.depth }, uStagger: { value: STAGGER },
-    uGlow: { value: 1 }, uSettle: { value: 0 }
+    uGlow: { value: 1 }, uSettle: { value: 0 },
+    uPointer: { value: new THREE.Vector3(0, 0, 0) }   // xy = local bust coords, z = hover strength (0..1)
   };
 
   var material = new THREE.ShaderMaterial({
@@ -109,10 +112,11 @@
       'attribute vec4 aColor;',      // rgb = photo colour, a = how deep in the pile
       'attribute vec4 aSeed;',       // x = launch delay, yzw = random
       'attribute vec3 aRelief;',     // xy = heightfield slope (dh/dx, dh/dy), z = local cavity AO
-      'uniform float uProgress, uTime, uCube, uDepth, uStagger;',
+      'uniform float uProgress, uTime, uCube, uDepth, uStagger, uSettle;',
+      'uniform vec3 uPointer;',
       'varying vec3 vColor, vLocal, vViewW, vRelief;',
       'varying mat3 vRot;',
-      'varying float vT, vSeed, vTint, vWy, vDeep;',
+      'varying float vT, vSeed, vTint, vWy, vDeep, vHover;',
       'float ease(float t){ return t*t*t*(t*(6.0*t-15.0)+10.0); }',
       'mat3 rot(vec3 a, float ang){',
       '  float s = sin(ang), c = cos(ang), o = 1.0 - c;',
@@ -126,6 +130,13 @@
       '  float ey = ease(smoothstep(0.22, 1.0, t));',  // then climb
       '  float free = 1.0 - e;',
       '  float lock = smoothstep(0.9, 1.0, t);',
+      // physical lock-in spring recoil: punch slightly forward on arrival, then snap back
+      '  float snapWindow = smoothstep(0.84, 0.93, t) * (1.0 - smoothstep(0.93, 1.0, t));',
+      '  float recoil = snapWindow * (0.22 + 0.14 * aSeed.y) * uCube;',
+      // interactive 3D cursor ripple across the assembled portrait
+      '  float pDist = length(aTarget.xy - uPointer.xy);',
+      '  float hover = uPointer.z * lock * exp(-pDist * pDist / 1.35);',
+      '  float hoverPush = hover * (0.28 + 0.10 * sin(uTime * 7.0 - pDist * 4.5)) * uCube;',
       // lie still at a random angle on the floor, tumble in the air, square up on arrival
       '  vec3 rAxis = normalize(vec3(aSeed.y, aSeed.z, aSeed.w) - 0.5 + 1e-4);',
       '  vec3 restAxis = normalize(mix(vec3(0.0, 1.0, 0.0), rAxis, aColor.a));',
@@ -133,11 +144,11 @@
       // once locked, extend each cube backwards into a column so the relief is solid
       '  vec3 lp = position;',
       '  float jz = (aSeed.w - 0.5) * uCube * 0.7;',   // each cube sits a little proud or shy of its neighbours
-      '  if (lp.z < 0.0) lp.z -= lock * ((aTarget.z + 0.5) * uDepth + jz + 0.35*uCube) / uCube;',
+      '  if (lp.z < 0.0) lp.z -= lock * ((aTarget.z + 0.5) * uDepth + jz + hoverPush + 0.35*uCube) / uCube;',
       '  vDeep = 0.5 - lp.z;',                          // how far down the column, in cube widths
       '  float s = uCube * mix(2.3 + 0.9*aSeed.z, 1.0, ey);',
       '  vec3 p = R * (lp * s);',
-      '  vec3 tgt = vec3(aTarget.xy, aTarget.z * uDepth + jz);',
+      '  vec3 tgt = vec3(aTarget.xy, aTarget.z * uDepth + jz + recoil + hoverPush);',
       '  vec3 c;',
       '  c.xz = mix(aStart.xz, tgt.xz, e);',
       '  c.y = mix(aStart.y, tgt.y, ey);',
@@ -148,7 +159,7 @@
       '  vec4 wp = modelMatrix * vec4(c + p, 1.0);',
       '  gl_Position = projectionMatrix * viewMatrix * wp;',
       '  vColor = aColor.rgb; vLocal = position; vT = t; vSeed = aSeed.w; vTint = aSeed.z;',
-      '  vRelief = aRelief;',
+      '  vRelief = aRelief; vHover = hover;',
       '  vRot = mat3(modelMatrix) * R;',
       '  vViewW = cameraPosition - wp.xyz;',
       '  vWy = wp.y;',
@@ -158,7 +169,7 @@
       'uniform float uTime, uGlow, uSettle, uDepth;',
       'varying vec3 vColor, vLocal, vViewW, vRelief;',
       'varying mat3 vRot;',
-      'varying float vT, vSeed, vTint, vWy, vDeep;',
+      'varying float vT, vSeed, vTint, vWy, vDeep, vHover;',
       'float hash(vec2 p){ return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }',
       // circuit-board traces: straight runs, corners and pads on a 4x4 grid per face
       'float traces(vec2 uv, float seed){',
@@ -193,12 +204,24 @@
       '  float ndv = max(dot(n, v), 0.0);',
       '  float F = 0.06 + 0.94 * pow(1.0 - ndv, 5.0);',
       '  vec3 refl = env(reflect(-v, n));',
-      '  vec2 uv; float fid;',
-      '  if (a.x > a.y && a.x > a.z) { uv = vLocal.yz; fid = 1.0 + step(0.0, vLocal.x); }',
-      '  else if (a.y > a.z) { uv = vLocal.xz; fid = 3.0 + step(0.0, vLocal.y); }',
-      '  else { uv = vLocal.xy; fid = 5.0 + step(0.0, vLocal.z); }',
-      '  uv += 0.5;',
-      '  float tr = mix(traces(uv, vSeed * 7.0 + fid), 0.22, far);',
+      // crisp, non-stretched side traces along extended relief columns
+      '  vec2 uv; float fid; float cellId = 0.0;',
+      '  float sideFade = far;',
+      '  if (a.x > a.y && a.x > a.z) {',
+      '    uv = vec2(vLocal.y + 0.5, fract(vDeep * 0.5));',
+      '    cellId = floor(vDeep * 0.5) * 1.7;',
+      '    fid = 1.0 + step(0.0, vLocal.x);',
+      '    sideFade = max(far, smoothstep(0.18, 0.65, fwidth(vDeep)));',
+      '  } else if (a.y > a.z) {',
+      '    uv = vec2(vLocal.x + 0.5, fract(vDeep * 0.5));',
+      '    cellId = floor(vDeep * 0.5) * 1.7;',
+      '    fid = 3.0 + step(0.0, vLocal.y);',
+      '    sideFade = max(far, smoothstep(0.18, 0.65, fwidth(vDeep)));',
+      '  } else {',
+      '    uv = vLocal.xy + 0.5;',
+      '    fid = 5.0 + step(0.0, vLocal.z);',
+      '  }',
+      '  float tr = mix(traces(uv, vSeed * 7.0 + fid + cellId), 0.22, sideFade);',
       '  float flow = 0.65 + 0.35 * sin(uTime*3.0 + (uv.x + uv.y)*5.0 + vSeed*40.0);',
       '  float breathe = 0.75 + 0.25 * sin(uTime*1.3 + vSeed*60.0);',
       '  float charge = (0.55 + 0.9 * smoothstep(0.0, 0.3, vT)) * (1.0 - 0.5*uSettle);',   // cubes left on the floor calm down at the end
@@ -211,13 +234,15 @@
       '  vec3 hot = vec3(1.0, 0.72, 0.55);',
       '  vec3 emis = mix(red, hot, tr*0.6) * tr * flow * charge * uGlow * 1.1;',
       '  vec3 energized = glass + emis + red * edge * 0.25 * uGlow * charge + refl * (F + 0.05);',
-      // the portrait: blend cube bevel normal with macro 3D relief normal so head turns catch real light
+      // the portrait: 3D relief normals + cavity AO + warm rim backlighting
       '  float front = step(5.5, fid);',
       '  vec3 macroN = normalize(vRot * normalize(nl + vec3(vRelief.xy * uDepth * 0.22 * front, 0.0)));',
       '  float amb = mix(0.55, 0.85, far);',
       '  float shade = amb + (1.0 - amb) * max(dot(macroN, normalize(vec3(0.18, 0.24, 1.0))), 0.0);',
-      '  shade *= vRelief.z;',   // subtle cavity occlusion between recessed neighbour cubes
-      '  vec3 photo = vColor * shade + refl * F * 0.10;',
+      '  shade *= vRelief.z;',
+      '  float rim = pow(1.0 - max(dot(macroN, v), 0.0), 3.2) * (0.4 + 0.6 * uSettle);',
+      '  vec3 rimLight = vec3(1.0, 0.36, 0.22) * rim * 0.18 * (0.3 + 0.7 * uGlow);',
+      '  vec3 photo = vColor * shade + refl * F * 0.10 + rimLight;',
       // the photo wraps a little way down each column so the face survives a turn of the head;
       // deeper down (the outline of the figure) the columns are dark glass with a few live traces
       '  float deep = smoothstep(1.2, 3.5, vDeep) * (1.0 - front);',
@@ -225,12 +250,13 @@
       '  photo = mix(photo * mix(0.82, 1.0, front), sideCol, deep);',
       // until the whole face has settled, locked cubes stay dim and ember-tinted
       '  photo *= mix(vec3(0.46, 0.20, 0.17), vec3(1.0), uSettle);',
-      // afterglow: every few seconds a band of red energy climbs the finished figure
+      // afterglow + interactive hover ember wake
       '  float band = exp(-pow((vWy - (mod(uTime * 2.6, 34.0) - 9.0)) / 0.55, 2.0));',
-      '  photo += red * band * uSettle * uGlow * (0.10 + 0.9*max(tr, edge));',
+      '  float wake = max(band * uSettle, vHover * 0.85);',
+      '  photo += mix(red, hot, 0.35 * vHover) * wake * uGlow * (0.12 + 0.88*max(tr, edge));',
       '  float lock = smoothstep(0.9, 1.0, vT);',
       '  float flash = smoothstep(0.78, 0.92, vT) * (1.0 - smoothstep(0.92, 1.0, vT));',
-      '  vec3 col = mix(energized, photo, lock) + red * flash * uGlow * (0.3 + 0.7*max(tr, edge));',
+      '  vec3 col = mix(energized, photo, lock) + mix(red, hot, 0.35) * flash * uGlow * (0.35 + 0.65*max(tr, edge));',
       '  float fog = smoothstep(30.0, 95.0, length(vViewW));',
       '  col = mix(col, vec3(0.13, 0.105, 0.09), fog);',
       '  gl_FragColor = vec4(col, 1.0);',
@@ -240,16 +266,30 @@
 
   /* ---------- floor and backdrop ---------- */
   var FLOOR_Y = -FACE_H / 2 - 0.05;   // the bust rises straight out of the heap
-  var floorUniforms = { uEnergy: { value: 1 } };
+  var floorUniforms = {
+    uEnergy: { value: 1 },
+    uSettle: { value: 0 },
+    uGlow: { value: 1 },
+    uTime: { value: 0 },
+    uBustTint: { value: new THREE.Vector3(0.55, 0.42, 0.36) }
+  };
   var floorMesh = new THREE.Mesh(new THREE.CircleGeometry(140, 48), new THREE.ShaderMaterial({
     uniforms: floorUniforms,
     vertexShader: [
       'varying vec3 vW;',
-      'void main(){ vec4 w = modelMatrix * vec4(position, 1.0); vW = w.xyz; gl_Position = projectionMatrix * viewMatrix * w; }'
+      'varying vec2 vLocalXZ;',
+      'void main(){',
+      '  vec4 w = modelMatrix * vec4(position, 1.0);',
+      '  vW = w.xyz;',
+      '  vLocalXZ = vec2(position.x, -position.y);',
+      '  gl_Position = projectionMatrix * viewMatrix * w;',
+      '}'
     ].join('\n'),
     fragmentShader: [
-      'uniform float uEnergy;',
+      'uniform float uEnergy, uSettle, uGlow, uTime;',
+      'uniform vec3 uBustTint;',
       'varying vec3 vW;',
+      'varying vec2 vLocalXZ;',
       'float hash(vec2 p){ return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }',
       'void main(){',
       '  float d = length(vW.xz);',
@@ -258,6 +298,15 @@
       '  float grit = mix(hash(floor(vW.xz * 28.0)), 0.5, smoothstep(6.0, 22.0, length(cameraPosition - vW)));',
       '  vec3 col = vec3(0.016, 0.016, 0.019) + vec3(0.03) * grit;',
       '  col += vec3(0.5, 0.045, 0.02) * uEnergy * exp(-d*d / 110.0) * (0.55 + 0.45*grit);',  // red spill under the pile
+      // mirrored reflection of the standing bust & climbing red afterglow band on the wet floor
+      '  float rx = vLocalXZ.x / 3.8;',
+      '  float rz = (vLocalXZ.y - 3.2) / 5.2;',
+      '  float bustMask = exp(-(rx*rx * 1.4 + rz*rz * 1.2)) * step(-1.0, vLocalXZ.y);',
+      '  float reflY = clamp(vLocalXZ.y * 1.1 - 5.0, -5.0, 5.0);',
+      '  float bandY = mod(uTime * 2.6, 34.0) - 9.0;',
+      '  float reflBand = exp(-pow((reflY - bandY) / 0.85, 2.0)) * uSettle * uGlow;',
+      '  vec3 bustRefl = (uBustTint * 0.22 * uSettle + vec3(1.0, 0.16, 0.06) * reflBand * 0.45) * bustMask;',
+      '  col += bustRefl * (0.4 + 0.6 * F) * (0.65 + 0.35 * grit);',
       '  col += vec3(0.30, 0.27, 0.29) * F * (0.35 + 0.65*step(0.9, grit));',                 // wet sheen
       '  col = mix(col, vec3(0.13, 0.105, 0.09), smoothstep(12.0, 70.0, d));',
       '  gl_FragColor = vec4(col, 1.0);',
@@ -699,7 +748,8 @@
     seeds = new Float32Array(count * 4);
     var colors = new Float32Array(count * 4);
     var relief = new Float32Array(count * 3);
-    var halfW = (cols - 1) / 2, halfH = (rows - 1) / 2, i, x, y;
+    var halfW = (cols - 1) / 2, halfH = (rows - 1) / 2, i, x, y, inFigure = 0;
+    var sumR = 0, sumG = 0, sumB = 0;
 
     for (y = 0; y < rows; y++) {
       for (x = 0; x < cols; x++) {
@@ -730,7 +780,8 @@
         starts[i * 3 + 1] = FLOOR_Y + half + lift;
         starts[i * 3 + 2] = r * Math.sin(th);
 
-        colors[i * 4] = px[i * 4] / 255; colors[i * 4 + 1] = px[i * 4 + 1] / 255; colors[i * 4 + 2] = px[i * 4 + 2] / 255;
+        var cr = px[i * 4] / 255, cg = px[i * 4 + 1] / 255, cb = px[i * 4 + 2] / 255;
+        colors[i * 4] = cr; colors[i * 4 + 1] = cg; colors[i * 4 + 2] = cb;
         colors[i * 4 + 3] = Math.min(1, lift / (cubeSize * 3));
 
         if (mask[i]) {
@@ -738,10 +789,16 @@
           var d = Math.min(1, Math.sqrt(tx * tx + ty * ty) / (FACE_H * 0.64));
           var delay = Math.min(1, 0.6 * d + 0.4 * Math.random());
           seeds[i * 4] = delay;
+          sumR += cr; sumG += cg; sumB += cb;
+          inFigure++;
         } else {
           seeds[i * 4] = 2;      // background cube: a delay it can never reach, so it stays on the floor
         }
       }
+    }
+
+    if (inFigure > 0) {
+      floorUniforms.uBustTint.value.set(sumR / inFigure, sumG / inFigure, sumB / inFigure);
     }
     sfx.rebuild();
 
@@ -814,7 +871,7 @@
     }
   }
 
-  /* ---------- sizing ---------- */
+  /* ---------- sizing & pointer hover raycast ---------- */
   function resize() {
     var w = window.innerWidth, h = window.innerHeight;
     renderer.setSize(w, h, false);
@@ -827,6 +884,30 @@
     fitDist = Math.max(FACE_H * 0.66 / tanH, faceW * 0.6 / (tanH * camera.aspect));
   }
   window.addEventListener('resize', resize);
+
+  var raycaster = new THREE.Raycaster();
+  var pointerNDC = new THREE.Vector2();
+  var bustPlane = new THREE.Plane(new THREE.Vector3(0, 0, 1), 0);
+  var hitWorld = new THREE.Vector3();
+  var pointerGoal = new THREE.Vector3(0, 0, 0);
+
+  canvas.addEventListener('pointermove', function (e) {
+    if (orbiting) { pointerGoal.z = 0; return; }
+    pointerNDC.x = (e.clientX / window.innerWidth) * 2 - 1;
+    pointerNDC.y = -(e.clientY / window.innerHeight) * 2 + 1;
+    raycaster.setFromCamera(pointerNDC, camera);
+    bustPlane.normal.set(Math.sin(group.rotation.y), 0, Math.cos(group.rotation.y));
+    if (raycaster.ray.intersectPlane(bustPlane, hitWorld)) {
+      group.worldToLocal(hitWorld);
+      var halfW = (FACE_H / ASPECT) * 0.52, halfH = FACE_H * 0.52;
+      if (Math.abs(hitWorld.x) <= halfW && Math.abs(hitWorld.y) <= halfH) {
+        pointerGoal.set(hitWorld.x, hitWorld.y, 1);
+        return;
+      }
+    }
+    pointerGoal.z = 0;
+  });
+  canvas.addEventListener('pointerleave', function () { pointerGoal.z = 0; });
 
   /* ---------- controls ---------- */
   var playBtn = $('play'), scrub = $('scrub'), pct = $('pct'), soundChk = $('sound');
@@ -944,12 +1025,22 @@
     }
     var p = state.progress, settle = smooth(0.8, 1, p);
 
+    // smooth pointer hover coordinates and strength
+    var pEase = Math.min(1, dt * 10);
+    uniforms.uPointer.value.x = lerp(uniforms.uPointer.value.x, pointerGoal.x, pEase);
+    uniforms.uPointer.value.y = lerp(uniforms.uPointer.value.y, pointerGoal.y, pEase);
+    uniforms.uPointer.value.z = lerp(uniforms.uPointer.value.z, pointerGoal.z, Math.min(1, dt * 6));
+
     uniforms.uProgress.value = p;
     uniforms.uTime.value = time;
     uniforms.uDepth.value = state.depth;
     uniforms.uGlow.value = state.glow;
     uniforms.uSettle.value = settle;
+
     floorUniforms.uEnergy.value = state.glow * (1 - 0.85 * settle);
+    floorUniforms.uSettle.value = settle;
+    floorUniforms.uGlow.value = state.glow;
+    floorUniforms.uTime.value = time;
 
     sfx.update(dt, p);
 
